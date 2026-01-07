@@ -1,0 +1,495 @@
+name: Web Console Error Checker
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: '要检查的URL列表（用逗号分隔）'
+        required: false
+        default: ''
+      duration:
+        description: '每个页面等待时间（秒）'
+        required: false
+        default: '30'
+  schedule:
+    - cron: '0 */6 * * *'  # 每6小时运行一次
+
+jobs:
+  check-console-errors:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Puppeteer
+        run: |
+          npm install puppeteer
+
+      - name: Create error checker script
+        run: |
+          cat > check-errors.js << 'EOF'
+          const puppeteer = require('puppeteer');
+          const fs = require('fs');
+          const path = require('path');
+
+          // 从环境变量或配置文件读取URL列表
+          function getUrlsToCheck() {
+            const inputUrls = process.env.INPUT_URLS;
+            const configPath = path.join(process.cwd(), 'urls-config.json');
+            
+            if (inputUrls && inputUrls.trim()) {
+              return inputUrls.split(',').map(url => url.trim()).filter(Boolean);
+            }
+            
+            if (fs.existsSync(configPath)) {
+              const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+              return config.urls || [];
+            }
+            
+            return [];
+          }
+
+          async function checkPageErrors(url, duration) {
+            const browser = await puppeteer.launch({
+              headless: 'new',
+              args: ['--no-sandbox', '--disable-setuid-sandbox']
+            });
+            
+            const page = await browser.newPage();
+            const errors = [];
+            const warnings = [];
+            const logs = [];
+            const networkErrors = [];
+            const resourceErrors = {
+              css: [],
+              js: [],
+              images: [],
+              fonts: [],
+              ads: []
+            };
+
+            // 监听控制台消息
+            page.on('console', msg => {
+              const type = msg.type();
+              const text = msg.text();
+              const location = msg.location();
+              
+              const logEntry = {
+                type: type,
+                message: text,
+                url: location.url,
+                line: location.lineNumber,
+                column: location.columnNumber,
+                timestamp: new Date().toISOString()
+              };
+
+              if (type === 'error') {
+                errors.push(logEntry);
+              } else if (type === 'warning') {
+                warnings.push(logEntry);
+              } else {
+                logs.push(logEntry);
+              }
+            });
+
+            // 监听页面错误
+            page.on('pageerror', error => {
+              errors.push({
+                type: 'pageerror',
+                message: error.message,
+                stack: error.stack,
+                timestamp: new Date().toISOString()
+              });
+            });
+
+            // 监听所有请求响应
+            page.on('response', async response => {
+              const url = response.url();
+              const status = response.status();
+              const resourceType = response.request().resourceType();
+
+              // 检测失败的资源加载（4xx, 5xx错误）
+              if (status >= 400) {
+                const errorInfo = {
+                  url: url,
+                  status: status,
+                  statusText: response.statusText(),
+                  resourceType: resourceType,
+                  timestamp: new Date().toISOString()
+                };
+
+                // 分类资源错误
+                if (url.match(/\.css$/i) || resourceType === 'stylesheet') {
+                  resourceErrors.css.push(errorInfo);
+                  errors.push({
+                    type: 'css-load-error',
+                    message: `样式文件加载失败: ${url} (${status})`,
+                    url: url,
+                    status: status,
+                    timestamp: errorInfo.timestamp
+                  });
+                } else if (url.match(/\.js$/i) || resourceType === 'script') {
+                  resourceErrors.js.push(errorInfo);
+                  errors.push({
+                    type: 'js-load-error',
+                    message: `JavaScript文件加载失败: ${url} (${status})`,
+                    url: url,
+                    status: status,
+                    timestamp: errorInfo.timestamp
+                  });
+                } else if (resourceType === 'image') {
+                  resourceErrors.images.push(errorInfo);
+                } else if (url.match(/\.(woff|woff2|ttf|eot|otf)$/i) || resourceType === 'font') {
+                  resourceErrors.fonts.push(errorInfo);
+                }
+
+                // 检测广告相关错误
+                if (url.includes('googlesyndication') || 
+                    url.includes('doubleclick') || 
+                    url.includes('adservice') ||
+                    url.includes('googleadservices') ||
+                    url.includes('pagead') ||
+                    url.includes('/ads/')) {
+                  resourceErrors.ads.push(errorInfo);
+                  errors.push({
+                    type: 'ad-load-error',
+                    message: `广告加载失败: ${url} (${status})`,
+                    url: url,
+                    status: status,
+                    timestamp: errorInfo.timestamp
+                  });
+                }
+              }
+            });
+
+            // 监听请求失败（网络层面的失败）
+            page.on('requestfailed', request => {
+              const url = request.url();
+              const resourceType = request.resourceType();
+              const errorText = request.failure().errorText;
+
+              const errorInfo = {
+                url: url,
+                method: request.method(),
+                errorText: errorText,
+                resourceType: resourceType,
+                timestamp: new Date().toISOString()
+              };
+
+              networkErrors.push(errorInfo);
+
+              // 分类网络失败的资源
+              if (url.match(/\.css$/i) || resourceType === 'stylesheet') {
+                resourceErrors.css.push(errorInfo);
+                errors.push({
+                  type: 'css-network-error',
+                  message: `样式文件网络错误: ${url} - ${errorText}`,
+                  url: url,
+                  timestamp: errorInfo.timestamp
+                });
+              } else if (url.match(/\.js$/i) || resourceType === 'script') {
+                resourceErrors.js.push(errorInfo);
+              } else if (resourceType === 'image') {
+                resourceErrors.images.push(errorInfo);
+              } else if (url.match(/\.(woff|woff2|ttf|eot|otf)$/i)) {
+                resourceErrors.fonts.push(errorInfo);
+              }
+
+              // 检测广告网络错误
+              if (url.includes('googlesyndication') || 
+                  url.includes('doubleclick') || 
+                  url.includes('adservice') ||
+                  url.includes('googleadservices') ||
+                  url.includes('pagead') ||
+                  url.includes('/ads/')) {
+                resourceErrors.ads.push(errorInfo);
+                errors.push({
+                  type: 'ad-network-error',
+                  message: `广告网络错误: ${url} - ${errorText}`,
+                  url: url,
+                  timestamp: errorInfo.timestamp
+                });
+              }
+            });
+
+            try {
+              console.log(`正在访问: ${url}`);
+              await page.goto(url, { 
+                waitUntil: 'networkidle2',
+                timeout: 60000 
+              });
+              
+              // 等待指定时间
+              await new Promise(resolve => setTimeout(resolve, duration * 1000));
+              
+            } catch (error) {
+              errors.push({
+                type: 'navigation',
+                message: `导航错误: ${error.message}`,
+                timestamp: new Date().toISOString()
+              });
+            }
+
+            await browser.close();
+
+            return {
+              url,
+              errors,
+              warnings,
+              logs: logs.slice(0, 50), // 限制日志数量
+              networkErrors,
+              resourceErrors,
+              timestamp: new Date().toISOString()
+            };
+          }
+
+          function generateMarkdown(results) {
+            let md = `# 网页控制台错误报告\n\n`;
+            md += `生成时间: ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}\n\n`;
+            md += `---\n\n`;
+
+            results.forEach((result, index) => {
+              md += `## ${index + 1}. ${result.url}\n\n`;
+              md += `检查时间: ${new Date(result.timestamp).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}\n\n`;
+
+              // 错误统计
+              md += `### 📊 统计信息\n\n`;
+              md += `- ❌ 错误数量: ${result.errors.length}\n`;
+              md += `- ⚠️ 警告数量: ${result.warnings.length}\n`;
+              md += `- 🌐 网络错误: ${result.networkErrors.length}\n`;
+              md += `- 🎨 CSS加载失败: ${result.resourceErrors.css.length}\n`;
+              md += `- 📜 JS加载失败: ${result.resourceErrors.js.length}\n`;
+              md += `- 🖼️ 图片加载失败: ${result.resourceErrors.images.length}\n`;
+              md += `- 🔤 字体加载失败: ${result.resourceErrors.fonts.length}\n`;
+              md += `- 📢 广告加载失败: ${result.resourceErrors.ads.length}\n\n`;
+
+              // 错误详情
+              if (result.errors.length > 0) {
+                md += `### ❌ 错误列表\n\n`;
+                result.errors.forEach((error, idx) => {
+                  md += `#### 错误 ${idx + 1}\n\n`;
+                  md += `- **类型**: ${error.type}\n`;
+                  md += `- **消息**: \`${error.message}\`\n`;
+                  if (error.url) md += `- **文件**: ${error.url}\n`;
+                  if (error.line) md += `- **位置**: 第 ${error.line} 行，第 ${error.column} 列\n`;
+                  if (error.stack) md += `- **堆栈**:\n\`\`\`\n${error.stack}\n\`\`\`\n`;
+                  md += `- **时间**: ${new Date(error.timestamp).toLocaleTimeString('zh-CN')}\n\n`;
+                });
+              }
+
+              // 警告详情
+              if (result.warnings.length > 0) {
+                md += `### ⚠️ 警告列表\n\n`;
+                result.warnings.slice(0, 10).forEach((warning, idx) => {
+                  md += `${idx + 1}. \`${warning.message}\`\n`;
+                  if (warning.url) md += `   - 文件: ${warning.url}:${warning.line}\n`;
+                });
+                if (result.warnings.length > 10) {
+                  md += `\n*还有 ${result.warnings.length - 10} 条警告未显示*\n`;
+                }
+                md += `\n`;
+              }
+
+              // 网络错误
+              if (result.networkErrors.length > 0) {
+                md += `### 🌐 网络错误\n\n`;
+                result.networkErrors.forEach((netError, idx) => {
+                  md += `${idx + 1}. **${netError.method}** ${netError.url}\n`;
+                  md += `   - 错误: ${netError.errorText}\n\n`;
+                });
+              }
+
+              // CSS加载错误
+              if (result.resourceErrors.css.length > 0) {
+                md += `### 🎨 CSS样式加载错误\n\n`;
+                result.resourceErrors.css.forEach((cssError, idx) => {
+                  md += `${idx + 1}. ${cssError.url}\n`;
+                  if (cssError.status) {
+                    md += `   - HTTP状态: ${cssError.status} ${cssError.statusText}\n`;
+                  } else if (cssError.errorText) {
+                    md += `   - 错误: ${cssError.errorText}\n`;
+                  }
+                  md += `\n`;
+                });
+              }
+
+              // JS加载错误
+              if (result.resourceErrors.js.length > 0) {
+                md += `### 📜 JavaScript加载错误\n\n`;
+                result.resourceErrors.js.forEach((jsError, idx) => {
+                  md += `${idx + 1}. ${jsError.url}\n`;
+                  if (jsError.status) {
+                    md += `   - HTTP状态: ${jsError.status} ${jsError.statusText}\n`;
+                  } else if (jsError.errorText) {
+                    md += `   - 错误: ${jsError.errorText}\n`;
+                  }
+                  md += `\n`;
+                });
+              }
+
+              // 广告加载错误
+              if (result.resourceErrors.ads.length > 0) {
+                md += `### 📢 Google广告加载错误\n\n`;
+                result.resourceErrors.ads.forEach((adError, idx) => {
+                  md += `${idx + 1}. ${adError.url}\n`;
+                  if (adError.status) {
+                    md += `   - HTTP状态: ${adError.status} ${adError.statusText}\n`;
+                  } else if (adError.errorText) {
+                    md += `   - 网络错误: ${adError.errorText}\n`;
+                  }
+                  md += `   - 时间: ${new Date(adError.timestamp).toLocaleTimeString('zh-CN')}\n\n`;
+                });
+                
+                md += `> **提示**: 广告加载失败可能由于:\n`;
+                md += `> - 广告拦截插件\n`;
+                md += `> - 网络限制或防火墙\n`;
+                md += `> - 地区限制\n`;
+                md += `> - Google广告服务暂时不可用\n\n`;
+              }
+
+              // 图片加载错误（如果数量较多只显示部分）
+              if (result.resourceErrors.images.length > 0) {
+                md += `### 🖼️ 图片加载错误\n\n`;
+                const imagesToShow = result.resourceErrors.images.slice(0, 10);
+                imagesToShow.forEach((imgError, idx) => {
+                  md += `${idx + 1}. ${imgError.url}\n`;
+                  if (imgError.status) {
+                    md += `   - HTTP状态: ${imgError.status}\n`;
+                  } else if (imgError.errorText) {
+                    md += `   - 错误: ${imgError.errorText}\n`;
+                  }
+                  md += `\n`;
+                });
+                if (result.resourceErrors.images.length > 10) {
+                  md += `*还有 ${result.resourceErrors.images.length - 10} 张图片加载失败*\n\n`;
+                }
+              }
+
+              // 字体加载错误
+              if (result.resourceErrors.fonts.length > 0) {
+                md += `### 🔤 字体加载错误\n\n`;
+                result.resourceErrors.fonts.forEach((fontError, idx) => {
+                  md += `${idx + 1}. ${fontError.url}\n`;
+                  if (fontError.status) {
+                    md += `   - HTTP状态: ${fontError.status}\n`;
+                  } else if (fontError.errorText) {
+                    md += `   - 错误: ${fontError.errorText}\n`;
+                  }
+                  md += `\n`;
+                });
+              }
+
+              md += `---\n\n`;
+            });
+
+            return md;
+          }
+
+          async function main() {
+            const urls = getUrlsToCheck();
+            const duration = parseInt(process.env.INPUT_DURATION || '30');
+
+            if (urls.length === 0) {
+              console.log('❌ 没有找到要检查的URL');
+              process.exit(1);
+            }
+
+            console.log(`将检查 ${urls.length} 个URL，每个页面等待 ${duration} 秒\n`);
+
+            const results = [];
+            for (const url of urls) {
+              try {
+                const result = await checkPageErrors(url, duration);
+                results.push(result);
+                console.log(`✅ 完成: ${url} (错误: ${result.errors.length}, 警告: ${result.warnings.length})\n`);
+              } catch (error) {
+                console.error(`❌ 检查失败: ${url}`, error);
+                results.push({
+                  url,
+                  errors: [{ type: 'system', message: error.message, timestamp: new Date().toISOString() }],
+                  warnings: [],
+                  logs: [],
+                  networkErrors: [],
+                  resourceErrors: { css: [], js: [], images: [], fonts: [], ads: [] },
+                  timestamp: new Date().toISOString()
+                });
+              }
+            }
+
+            // 生成报告
+            const markdown = generateMarkdown(results);
+            const reportDir = path.join(process.cwd(), 'reports');
+            
+            if (!fs.existsSync(reportDir)) {
+              fs.mkdirSync(reportDir, { recursive: true });
+            }
+
+            const reportPath = path.join(reportDir, `error-report-${Date.now()}.md`);
+            fs.writeFileSync(reportPath, markdown);
+            fs.writeFileSync(path.join(reportDir, 'latest.md'), markdown);
+
+            console.log(`\n📝 报告已生成: ${reportPath}`);
+
+            // 输出总结
+            const totalErrors = results.reduce((sum, r) => sum + r.errors.length, 0);
+            const totalWarnings = results.reduce((sum, r) => sum + r.warnings.length, 0);
+            
+            console.log(`\n=== 总结 ===`);
+            console.log(`总错误数: ${totalErrors}`);
+            console.log(`总警告数: ${totalWarnings}`);
+
+            if (totalErrors > 0) {
+              process.exit(1);
+            }
+          }
+
+          main().catch(console.error);
+          EOF
+
+      - name: Run error check
+        env:
+          INPUT_URLS: ${{ github.event.inputs.urls }}
+          INPUT_DURATION: ${{ github.event.inputs.duration }}
+        run: node check-errors.js
+
+      - name: Upload error report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: error-report-${{ github.run_number }}
+          path: reports/
+          retention-days: 30
+
+      - name: Comment PR with report
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const reportPath = 'reports/latest.md';
+            
+            if (fs.existsSync(reportPath)) {
+              const report = fs.readFileSync(reportPath, 'utf8');
+              
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: report
+              });
+            }
+
+      - name: Commit report to repository
+        if: always()
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add reports/ || true
+          git commit -m "📝 Add error report - $(date +'%Y-%m-%d %H:%M:%S')" || true
+          git push || true
