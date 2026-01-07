@@ -22,19 +22,26 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Set up Chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+          install-chromedriver: true
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      - name: Install Puppeteer
+      - name: Install dependencies
         run: |
-          npm install puppeteer
+          npm install selenium-webdriver
 
       - name: Create error checker script
         run: |
           cat > check-errors.js << 'EOF'
-          const puppeteer = require('puppeteer');
+          const { Builder, By, until, logging } = require('selenium-webdriver');
+          const chrome = require('selenium-webdriver/chrome');
           const fs = require('fs');
           const path = require('path');
 
@@ -56,15 +63,30 @@ jobs:
           }
 
           async function checkPageErrors(url, duration) {
-            const browser = await puppeteer.launch({
-              headless: 'new',
-              args: ['--no-sandbox', '--disable-setuid-sandbox']
-            });
-            
-            const page = await browser.newPage();
+            const options = new chrome.Options();
+            options.addArguments(
+              '--headless=new',
+              '--no-sandbox',
+              '--disable-dev-shm-usage',
+              '--disable-gpu',
+              '--window-size=1920,1080',
+              '--disable-blink-features=AutomationControlled'
+            );
+
+            // 启用浏览器日志
+            const prefs = new logging.Preferences();
+            prefs.setLevel(logging.Type.BROWSER, logging.Level.ALL);
+            prefs.setLevel(logging.Type.DRIVER, logging.Level.ALL);
+            prefs.setLevel(logging.Type.PERFORMANCE, logging.Level.ALL);
+
+            const driver = await new Builder()
+              .forBrowser('chrome')
+              .setChromeOptions(options)
+              .setLoggingPrefs(prefs)
+              .build();
+
             const errors = [];
             const warnings = [];
-            const logs = [];
             const networkErrors = [];
             const resourceErrors = {
               css: [],
@@ -74,175 +96,223 @@ jobs:
               ads: []
             };
 
-            // 监听控制台消息
-            page.on('console', msg => {
-              const type = msg.type();
-              const text = msg.text();
-              const location = msg.location();
-              
-              const logEntry = {
-                type: type,
-                message: text,
-                url: location.url,
-                line: location.lineNumber,
-                column: location.columnNumber,
-                timestamp: new Date().toISOString()
-              };
-
-              if (type === 'error') {
-                errors.push(logEntry);
-              } else if (type === 'warning') {
-                warnings.push(logEntry);
-              } else {
-                logs.push(logEntry);
-              }
-            });
-
-            // 监听页面错误
-            page.on('pageerror', error => {
-              errors.push({
-                type: 'pageerror',
-                message: error.message,
-                stack: error.stack,
-                timestamp: new Date().toISOString()
-              });
-            });
-
-            // 监听所有请求响应
-            page.on('response', async response => {
-              const url = response.url();
-              const status = response.status();
-              const resourceType = response.request().resourceType();
-
-              // 检测失败的资源加载（4xx, 5xx错误）
-              if (status >= 400) {
-                const errorInfo = {
-                  url: url,
-                  status: status,
-                  statusText: response.statusText(),
-                  resourceType: resourceType,
-                  timestamp: new Date().toISOString()
-                };
-
-                // 分类资源错误
-                if (url.match(/\.css$/i) || resourceType === 'stylesheet') {
-                  resourceErrors.css.push(errorInfo);
-                  errors.push({
-                    type: 'css-load-error',
-                    message: `样式文件加载失败: ${url} (${status})`,
-                    url: url,
-                    status: status,
-                    timestamp: errorInfo.timestamp
-                  });
-                } else if (url.match(/\.js$/i) || resourceType === 'script') {
-                  resourceErrors.js.push(errorInfo);
-                  errors.push({
-                    type: 'js-load-error',
-                    message: `JavaScript文件加载失败: ${url} (${status})`,
-                    url: url,
-                    status: status,
-                    timestamp: errorInfo.timestamp
-                  });
-                } else if (resourceType === 'image') {
-                  resourceErrors.images.push(errorInfo);
-                } else if (url.match(/\.(woff|woff2|ttf|eot|otf)$/i) || resourceType === 'font') {
-                  resourceErrors.fonts.push(errorInfo);
-                }
-
-                // 检测广告相关错误
-                if (url.includes('googlesyndication') || 
-                    url.includes('doubleclick') || 
-                    url.includes('adservice') ||
-                    url.includes('googleadservices') ||
-                    url.includes('pagead') ||
-                    url.includes('/ads/')) {
-                  resourceErrors.ads.push(errorInfo);
-                  errors.push({
-                    type: 'ad-load-error',
-                    message: `广告加载失败: ${url} (${status})`,
-                    url: url,
-                    status: status,
-                    timestamp: errorInfo.timestamp
-                  });
-                }
-              }
-            });
-
-            // 监听请求失败（网络层面的失败）
-            page.on('requestfailed', request => {
-              const url = request.url();
-              const resourceType = request.resourceType();
-              const errorText = request.failure().errorText;
-
-              const errorInfo = {
-                url: url,
-                method: request.method(),
-                errorText: errorText,
-                resourceType: resourceType,
-                timestamp: new Date().toISOString()
-              };
-
-              networkErrors.push(errorInfo);
-
-              // 分类网络失败的资源
-              if (url.match(/\.css$/i) || resourceType === 'stylesheet') {
-                resourceErrors.css.push(errorInfo);
-                errors.push({
-                  type: 'css-network-error',
-                  message: `样式文件网络错误: ${url} - ${errorText}`,
-                  url: url,
-                  timestamp: errorInfo.timestamp
-                });
-              } else if (url.match(/\.js$/i) || resourceType === 'script') {
-                resourceErrors.js.push(errorInfo);
-              } else if (resourceType === 'image') {
-                resourceErrors.images.push(errorInfo);
-              } else if (url.match(/\.(woff|woff2|ttf|eot|otf)$/i)) {
-                resourceErrors.fonts.push(errorInfo);
-              }
-
-              // 检测广告网络错误
-              if (url.includes('googlesyndication') || 
-                  url.includes('doubleclick') || 
-                  url.includes('adservice') ||
-                  url.includes('googleadservices') ||
-                  url.includes('pagead') ||
-                  url.includes('/ads/')) {
-                resourceErrors.ads.push(errorInfo);
-                errors.push({
-                  type: 'ad-network-error',
-                  message: `广告网络错误: ${url} - ${errorText}`,
-                  url: url,
-                  timestamp: errorInfo.timestamp
-                });
-              }
-            });
-
             try {
               console.log(`正在访问: ${url}`);
-              await page.goto(url, { 
-                waitUntil: 'networkidle2',
-                timeout: 60000 
-              });
               
-              // 等待指定时间
+              // 启用性能日志以捕获网络请求
+              await driver.get(url);
+              
+              // 等待页面加载
+              await driver.wait(until.elementLocated(By.tagName('body')), 10000);
+              
+              // 等待指定时间让所有资源加载
               await new Promise(resolve => setTimeout(resolve, duration * 1000));
+
+              // 获取浏览器日志
+              const browserLogs = await driver.manage().logs().get(logging.Type.BROWSER);
               
+              browserLogs.forEach(entry => {
+                const message = entry.message;
+                const level = entry.level.name;
+                const timestamp = new Date(entry.timestamp).toISOString();
+
+                const logEntry = {
+                  type: level.toLowerCase(),
+                  message: message,
+                  timestamp: timestamp,
+                  level: level
+                };
+
+                // 解析URL和错误类型
+                let errorUrl = '';
+                const urlMatch = message.match(/https?:\/\/[^\s"')]+/);
+                if (urlMatch) {
+                  errorUrl = urlMatch[0];
+                }
+
+                // 分类错误
+                if (level === 'SEVERE' || level === 'ERROR') {
+                  // CSS错误
+                  if (message.includes('.css') || 
+                      message.toLowerCase().includes('stylesheet') ||
+                      (errorUrl && errorUrl.match(/\.css(\?|$)/))) {
+                    const cssError = {
+                      url: errorUrl || 'unknown',
+                      message: message,
+                      timestamp: timestamp
+                    };
+                    resourceErrors.css.push(cssError);
+                    errors.push({
+                      type: 'css-error',
+                      message: `CSS加载错误: ${message}`,
+                      url: errorUrl,
+                      timestamp: timestamp
+                    });
+                  }
+                  // JS错误
+                  else if (message.includes('.js') || 
+                           message.toLowerCase().includes('script') ||
+                           (errorUrl && errorUrl.match(/\.js(\?|$)/))) {
+                    const jsError = {
+                      url: errorUrl || 'unknown',
+                      message: message,
+                      timestamp: timestamp
+                    };
+                    resourceErrors.js.push(jsError);
+                    errors.push({
+                      type: 'js-error',
+                      message: `JavaScript错误: ${message}`,
+                      url: errorUrl,
+                      timestamp: timestamp
+                    });
+                  }
+                  // 广告错误
+                  else if (message.includes('googlesyndication') ||
+                           message.includes('doubleclick') ||
+                           message.includes('adservice') ||
+                           message.includes('googleadservices') ||
+                           message.includes('pagead') ||
+                           message.includes('adsbygoogle')) {
+                    const adError = {
+                      url: errorUrl || 'unknown',
+                      message: message,
+                      timestamp: timestamp
+                    };
+                    resourceErrors.ads.push(adError);
+                    errors.push({
+                      type: 'ad-error',
+                      message: `广告加载错误: ${message}`,
+                      url: errorUrl,
+                      timestamp: timestamp
+                    });
+                  }
+                  // 图片错误
+                  else if (message.match(/\.(jpg|jpeg|png|gif|svg|webp|ico)/i) ||
+                           (errorUrl && errorUrl.match(/\.(jpg|jpeg|png|gif|svg|webp|ico)(\?|$)/i))) {
+                    resourceErrors.images.push({
+                      url: errorUrl || 'unknown',
+                      message: message,
+                      timestamp: timestamp
+                    });
+                  }
+                  // 字体错误
+                  else if (message.match(/\.(woff|woff2|ttf|eot|otf)/i) ||
+                           (errorUrl && errorUrl.match(/\.(woff|woff2|ttf|eot|otf)(\?|$)/i))) {
+                    resourceErrors.fonts.push({
+                      url: errorUrl || 'unknown',
+                      message: message,
+                      timestamp: timestamp
+                    });
+                  }
+                  // 网络错误
+                  else if (message.includes('ERR_') || 
+                           message.includes('Failed to load') ||
+                           message.includes('net::') ||
+                           message.includes('404') ||
+                           message.includes('500') ||
+                           message.includes('403')) {
+                    networkErrors.push({
+                      url: errorUrl || 'unknown',
+                      message: message,
+                      timestamp: timestamp
+                    });
+                  }
+                  // 其他错误
+                  else {
+                    errors.push(logEntry);
+                  }
+                } else if (level === 'WARNING') {
+                  warnings.push(logEntry);
+                }
+              });
+
+              // 执行自定义JavaScript检查页面错误
+              const pageErrors = await driver.executeScript(`
+                const errors = [];
+                
+                // 检查是否有未加载的样式表
+                const stylesheets = document.styleSheets;
+                for (let i = 0; i < stylesheets.length; i++) {
+                  try {
+                    const sheet = stylesheets[i];
+                    if (!sheet.cssRules && !sheet.rules) {
+                      errors.push({
+                        type: 'css-blocked',
+                        url: sheet.href || 'inline style',
+                        message: 'CSS样式表无法访问（可能被CORS阻止）'
+                      });
+                    }
+                  } catch (e) {
+                    errors.push({
+                      type: 'css-access-error',
+                      url: stylesheets[i].href || 'unknown',
+                      message: 'CSS访问错误: ' + e.message
+                    });
+                  }
+                }
+
+                // 检查图片加载失败
+                const images = document.querySelectorAll('img');
+                images.forEach(img => {
+                  if (!img.complete || img.naturalHeight === 0) {
+                    errors.push({
+                      type: 'image-load-error',
+                      url: img.src,
+                      message: '图片加载失败'
+                    });
+                  }
+                });
+
+                // 检查Google广告是否加载
+                const adSlots = document.querySelectorAll('ins.adsbygoogle');
+                adSlots.forEach(slot => {
+                  if (!slot.getAttribute('data-ad-status') || 
+                      slot.getAttribute('data-ad-status') === 'unfilled') {
+                    errors.push({
+                      type: 'ad-unfilled',
+                      message: '广告位未填充',
+                      element: slot.className
+                    });
+                  }
+                });
+
+                // 检查广告脚本是否加载
+                if (typeof adsbygoogle === 'undefined' && document.querySelector('ins.adsbygoogle')) {
+                  errors.push({
+                    type: 'ad-script-missing',
+                    message: 'Google广告脚本未加载（adsbygoogle未定义）'
+                  });
+                }
+
+                return errors;
+              `);
+
+              // 合并页面检查结果
+              pageErrors.forEach(err => {
+                if (err.type.includes('css')) {
+                  resourceErrors.css.push(err);
+                } else if (err.type.includes('image')) {
+                  resourceErrors.images.push(err);
+                } else if (err.type.includes('ad')) {
+                  resourceErrors.ads.push(err);
+                }
+                errors.push(err);
+              });
+
             } catch (error) {
               errors.push({
                 type: 'navigation',
                 message: `导航错误: ${error.message}`,
                 timestamp: new Date().toISOString()
               });
+            } finally {
+              await driver.quit();
             }
-
-            await browser.close();
 
             return {
               url,
               errors,
               warnings,
-              logs: logs.slice(0, 50), // 限制日志数量
               networkErrors,
               resourceErrors,
               timestamp: new Date().toISOString()
@@ -252,6 +322,7 @@ jobs:
           function generateMarkdown(results) {
             let md = `# 网页控制台错误报告\n\n`;
             md += `生成时间: ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}\n\n`;
+            md += `Chrome版本: 120\n\n`;
             md += `---\n\n`;
 
             results.forEach((result, index) => {
@@ -267,53 +338,16 @@ jobs:
               md += `- 📜 JS加载失败: ${result.resourceErrors.js.length}\n`;
               md += `- 🖼️ 图片加载失败: ${result.resourceErrors.images.length}\n`;
               md += `- 🔤 字体加载失败: ${result.resourceErrors.fonts.length}\n`;
-              md += `- 📢 广告加载失败: ${result.resourceErrors.ads.length}\n\n`;
-
-              // 错误详情
-              if (result.errors.length > 0) {
-                md += `### ❌ 错误列表\n\n`;
-                result.errors.forEach((error, idx) => {
-                  md += `#### 错误 ${idx + 1}\n\n`;
-                  md += `- **类型**: ${error.type}\n`;
-                  md += `- **消息**: \`${error.message}\`\n`;
-                  if (error.url) md += `- **文件**: ${error.url}\n`;
-                  if (error.line) md += `- **位置**: 第 ${error.line} 行，第 ${error.column} 列\n`;
-                  if (error.stack) md += `- **堆栈**:\n\`\`\`\n${error.stack}\n\`\`\`\n`;
-                  md += `- **时间**: ${new Date(error.timestamp).toLocaleTimeString('zh-CN')}\n\n`;
-                });
-              }
-
-              // 警告详情
-              if (result.warnings.length > 0) {
-                md += `### ⚠️ 警告列表\n\n`;
-                result.warnings.slice(0, 10).forEach((warning, idx) => {
-                  md += `${idx + 1}. \`${warning.message}\`\n`;
-                  if (warning.url) md += `   - 文件: ${warning.url}:${warning.line}\n`;
-                });
-                if (result.warnings.length > 10) {
-                  md += `\n*还有 ${result.warnings.length - 10} 条警告未显示*\n`;
-                }
-                md += `\n`;
-              }
-
-              // 网络错误
-              if (result.networkErrors.length > 0) {
-                md += `### 🌐 网络错误\n\n`;
-                result.networkErrors.forEach((netError, idx) => {
-                  md += `${idx + 1}. **${netError.method}** ${netError.url}\n`;
-                  md += `   - 错误: ${netError.errorText}\n\n`;
-                });
-              }
+              md += `- 📢 广告问题: ${result.resourceErrors.ads.length}\n\n`;
 
               // CSS加载错误
               if (result.resourceErrors.css.length > 0) {
                 md += `### 🎨 CSS样式加载错误\n\n`;
                 result.resourceErrors.css.forEach((cssError, idx) => {
-                  md += `${idx + 1}. ${cssError.url}\n`;
-                  if (cssError.status) {
-                    md += `   - HTTP状态: ${cssError.status} ${cssError.statusText}\n`;
-                  } else if (cssError.errorText) {
-                    md += `   - 错误: ${cssError.errorText}\n`;
+                  md += `${idx + 1}. **${cssError.url || 'Unknown'}**\n`;
+                  md += `   - 消息: ${cssError.message}\n`;
+                  if (cssError.timestamp) {
+                    md += `   - 时间: ${new Date(cssError.timestamp).toLocaleTimeString('zh-CN')}\n`;
                   }
                   md += `\n`;
                 });
@@ -323,11 +357,10 @@ jobs:
               if (result.resourceErrors.js.length > 0) {
                 md += `### 📜 JavaScript加载错误\n\n`;
                 result.resourceErrors.js.forEach((jsError, idx) => {
-                  md += `${idx + 1}. ${jsError.url}\n`;
-                  if (jsError.status) {
-                    md += `   - HTTP状态: ${jsError.status} ${jsError.statusText}\n`;
-                  } else if (jsError.errorText) {
-                    md += `   - 错误: ${jsError.errorText}\n`;
+                  md += `${idx + 1}. **${jsError.url || 'Unknown'}**\n`;
+                  md += `   - 消息: ${jsError.message}\n`;
+                  if (jsError.timestamp) {
+                    md += `   - 时间: ${new Date(jsError.timestamp).toLocaleTimeString('zh-CN')}\n`;
                   }
                   md += `\n`;
                 });
@@ -335,36 +368,38 @@ jobs:
 
               // 广告加载错误
               if (result.resourceErrors.ads.length > 0) {
-                md += `### 📢 Google广告加载错误\n\n`;
+                md += `### 📢 Google广告问题\n\n`;
                 result.resourceErrors.ads.forEach((adError, idx) => {
-                  md += `${idx + 1}. ${adError.url}\n`;
-                  if (adError.status) {
-                    md += `   - HTTP状态: ${adError.status} ${adError.statusText}\n`;
-                  } else if (adError.errorText) {
-                    md += `   - 网络错误: ${adError.errorText}\n`;
+                  md += `${idx + 1}. ${adError.type || 'ad-error'}\n`;
+                  if (adError.url) {
+                    md += `   - URL: ${adError.url}\n`;
                   }
-                  md += `   - 时间: ${new Date(adError.timestamp).toLocaleTimeString('zh-CN')}\n\n`;
+                  md += `   - 消息: ${adError.message}\n`;
+                  if (adError.element) {
+                    md += `   - 元素: ${adError.element}\n`;
+                  }
+                  if (adError.timestamp) {
+                    md += `   - 时间: ${new Date(adError.timestamp).toLocaleTimeString('zh-CN')}\n`;
+                  }
+                  md += `\n`;
                 });
                 
-                md += `> **提示**: 广告加载失败可能由于:\n`;
-                md += `> - 广告拦截插件\n`;
-                md += `> - 网络限制或防火墙\n`;
-                md += `> - 地区限制\n`;
-                md += `> - Google广告服务暂时不可用\n\n`;
+                md += `> **提示**: 广告问题可能由于:\n`;
+                md += `> - 广告拦截插件（浏览器扩展或系统级）\n`;
+                md += `> - 网络限制或防火墙规则\n`;
+                md += `> - CORS策略限制\n`;
+                md += `> - 地区限制或IP封禁\n`;
+                md += `> - Google广告服务暂时不可用\n`;
+                md += `> - 广告位未正确配置\n\n`;
               }
 
-              // 图片加载错误（如果数量较多只显示部分）
+              // 图片加载错误
               if (result.resourceErrors.images.length > 0) {
                 md += `### 🖼️ 图片加载错误\n\n`;
                 const imagesToShow = result.resourceErrors.images.slice(0, 10);
                 imagesToShow.forEach((imgError, idx) => {
                   md += `${idx + 1}. ${imgError.url}\n`;
-                  if (imgError.status) {
-                    md += `   - HTTP状态: ${imgError.status}\n`;
-                  } else if (imgError.errorText) {
-                    md += `   - 错误: ${imgError.errorText}\n`;
-                  }
-                  md += `\n`;
+                  md += `   - 消息: ${imgError.message}\n\n`;
                 });
                 if (result.resourceErrors.images.length > 10) {
                   md += `*还有 ${result.resourceErrors.images.length - 10} 张图片加载失败*\n\n`;
@@ -376,13 +411,49 @@ jobs:
                 md += `### 🔤 字体加载错误\n\n`;
                 result.resourceErrors.fonts.forEach((fontError, idx) => {
                   md += `${idx + 1}. ${fontError.url}\n`;
-                  if (fontError.status) {
-                    md += `   - HTTP状态: ${fontError.status}\n`;
-                  } else if (fontError.errorText) {
-                    md += `   - 错误: ${fontError.errorText}\n`;
-                  }
+                  md += `   - 消息: ${fontError.message}\n\n`;
+                });
+              }
+
+              // 网络错误
+              if (result.networkErrors.length > 0) {
+                md += `### 🌐 网络错误\n\n`;
+                result.networkErrors.forEach((netError, idx) => {
+                  md += `${idx + 1}. ${netError.url}\n`;
+                  md += `   - 消息: ${netError.message}\n\n`;
+                });
+              }
+
+              // 其他错误详情
+              const otherErrors = result.errors.filter(e => 
+                !['css-error', 'js-error', 'ad-error', 'image-load-error', 'css-blocked', 'css-access-error', 'ad-unfilled', 'ad-script-missing'].includes(e.type)
+              );
+              
+              if (otherErrors.length > 0) {
+                md += `### ❌ 其他错误\n\n`;
+                otherErrors.slice(0, 10).forEach((error, idx) => {
+                  md += `#### 错误 ${idx + 1}\n\n`;
+                  md += `- **类型**: ${error.type}\n`;
+                  md += `- **消息**: \`${error.message}\`\n`;
+                  if (error.url) md += `- **URL**: ${error.url}\n`;
+                  if (error.timestamp) md += `- **时间**: ${new Date(error.timestamp).toLocaleTimeString('zh-CN')}\n`;
                   md += `\n`;
                 });
+                if (otherErrors.length > 10) {
+                  md += `*还有 ${otherErrors.length - 10} 个错误未显示*\n\n`;
+                }
+              }
+
+              // 警告详情
+              if (result.warnings.length > 0) {
+                md += `### ⚠️ 警告列表\n\n`;
+                result.warnings.slice(0, 10).forEach((warning, idx) => {
+                  md += `${idx + 1}. \`${warning.message}\`\n`;
+                });
+                if (result.warnings.length > 10) {
+                  md += `\n*还有 ${result.warnings.length - 10} 条警告未显示*\n`;
+                }
+                md += `\n`;
               }
 
               md += `---\n\n`;
@@ -397,24 +468,26 @@ jobs:
 
             if (urls.length === 0) {
               console.log('❌ 没有找到要检查的URL');
+              console.log('请在workflow输入中提供URL，或在仓库根目录创建 urls-config.json 文件');
               process.exit(1);
             }
 
-            console.log(`将检查 ${urls.length} 个URL，每个页面等待 ${duration} 秒\n`);
+            console.log(`将使用Chrome 120检查 ${urls.length} 个URL，每个页面等待 ${duration} 秒\n`);
 
             const results = [];
             for (const url of urls) {
               try {
                 const result = await checkPageErrors(url, duration);
                 results.push(result);
-                console.log(`✅ 完成: ${url} (错误: ${result.errors.length}, 警告: ${result.warnings.length})\n`);
+                console.log(`✅ 完成: ${url}`);
+                console.log(`   错误: ${result.errors.length}, 警告: ${result.warnings.length}`);
+                console.log(`   CSS错误: ${result.resourceErrors.css.length}, 广告问题: ${result.resourceErrors.ads.length}\n`);
               } catch (error) {
                 console.error(`❌ 检查失败: ${url}`, error);
                 results.push({
                   url,
                   errors: [{ type: 'system', message: error.message, timestamp: new Date().toISOString() }],
                   warnings: [],
-                  logs: [],
                   networkErrors: [],
                   resourceErrors: { css: [], js: [], images: [], fonts: [], ads: [] },
                   timestamp: new Date().toISOString()
@@ -439,10 +512,14 @@ jobs:
             // 输出总结
             const totalErrors = results.reduce((sum, r) => sum + r.errors.length, 0);
             const totalWarnings = results.reduce((sum, r) => sum + r.warnings.length, 0);
+            const totalCssErrors = results.reduce((sum, r) => sum + r.resourceErrors.css.length, 0);
+            const totalAdErrors = results.reduce((sum, r) => sum + r.resourceErrors.ads.length, 0);
             
             console.log(`\n=== 总结 ===`);
             console.log(`总错误数: ${totalErrors}`);
             console.log(`总警告数: ${totalWarnings}`);
+            console.log(`CSS错误: ${totalCssErrors}`);
+            console.log(`广告问题: ${totalAdErrors}`);
 
             if (totalErrors > 0) {
               process.exit(1);
